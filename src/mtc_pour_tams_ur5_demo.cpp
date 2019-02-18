@@ -49,15 +49,19 @@ int main(int argc, char** argv){
 		moveit::planning_interface::PlanningSceneInterface psi;
 		mtc_pour::setupObjects(objs, bottle, glass);
 		psi.applyCollisionObjects(objs);
-		
-		// TODO: attach bottle in gripper
 	}
 
+	// TODO: why does a restart trigger a new panel entry
 	Task t("my_task");
 	t.loadRobotModel();
 
+	// TODO: id of solution in rviz panel is sometimes 0 and then changes
+
 	auto sampling_planner = std::make_shared<solvers::PipelinePlanner>();
 	sampling_planner->setProperty("goal_joint_tolerance", 1e-5);
+	// TODO: ignored because it is always overruled by Connect's timeout property
+	//sampling_planner->setTimeout(15.0);
+	//pipeline->setPlannerId("");
 
 	// don't spill liquid
 	moveit_msgs::Constraints upright_constraint;
@@ -90,7 +94,90 @@ int main(int argc, char** argv){
 		t.add(std::move(_current_state));
 	}
 
-/* Not needed if the arm is already above the glass
+	{
+		auto stage = std::make_unique<stages::MoveTo>("open gripper", sampling_planner);
+		stage->setGroup("gripper");
+		stage->setGoal("open");
+		t.add(std::move(stage));
+	}
+
+	{
+		// TODO: overload for single planner case
+		auto stage = std::make_unique<stages::Connect>("move to pre-grasp pose", stages::Connect::GroupPlannerVector {{"arm", sampling_planner}});
+		stage->properties().configureInitFrom(Stage::PARENT); // TODO: convenience-wrapper
+		t.add(std::move(stage));
+	}
+
+	{
+		auto stage = std::make_unique<stages::MoveRelative>("approach object", cartesian_planner);
+		stage->setMarkerNS("approach");
+		stage->properties().set("link", "s_model_tool0");
+		stage->properties().configureInitFrom(Stage::PARENT, {"group"});
+		stage->setMinMaxDistance(.15, .25);
+
+		geometry_msgs::Vector3Stamped vec;
+		vec.header.frame_id = "s_model_tool0";
+		vec.vector.x = 1.0;
+		stage->setDirection(vec);
+		t.add(std::move(stage));
+	}
+
+	{
+		auto stage = std::make_unique<stages::GenerateGraspPose>("grasp workspace pose");
+		stage->properties().configureInitFrom(Stage::PARENT);
+		stage->setPreGraspPose("open");
+		stage->setObject("bottle");
+		stage->setAngleDelta(M_PI/6);
+
+		stage->setMonitoredStage(current_state);
+
+		auto wrapper = std::make_unique<stages::ComputeIK>("grasp pose", std::move(stage) );
+		wrapper->setMaxIKSolutions(8);
+		wrapper->setIKFrame(Eigen::Translation3d(0.05,0,0), "s_model_tool0");
+		// TODO adding this will initialize "target_pose" which is internal (or isn't it?)
+		//wrapper->properties().configureInitFrom(Stage::PARENT);
+		wrapper->properties().configureInitFrom(Stage::PARENT, {"eef"}); // TODO: convenience wrapper
+		wrapper->properties().configureInitFrom(Stage::INTERFACE, {"target_pose"});
+		t.add(std::move(wrapper));
+	}
+
+	// TODO: encapsulate these three states in stages::Grasp or similar
+	{
+		auto stage = std::make_unique<stages::ModifyPlanningScene>("allow gripper->object collision");
+		stage->allowCollisions("bottle", t.getRobotModel()->getJointModelGroup("gripper")->getLinkModelNamesWithCollisionGeometry(), true);
+		t.add(std::move(stage));
+	}
+
+	{
+		auto stage = std::make_unique<stages::MoveTo>("close gripper", sampling_planner);
+		stage->properties().property("group").configureInitFrom(Stage::PARENT, "gripper"); // TODO this is not convenient
+		stage->setGoal("closed");
+		t.add(std::move(stage));
+	}
+
+	Stage* object_grasped= nullptr;
+	{
+		auto stage = std::make_unique<stages::ModifyPlanningScene>("attach object");
+		stage->attachObject("bottle", "s_model_tool0");
+		object_grasped= stage.get();
+		t.add(std::move(stage));
+	}
+
+	{
+		auto stage = std::make_unique<stages::MoveRelative>("lift object", cartesian_planner);
+		stage->properties().configureInitFrom(Stage::PARENT, {"group"});
+		stage->setMinMaxDistance(.08,.13);
+		stage->setIKFrame("s_model_tool0"); // TODO property for frame
+
+		stage->setMarkerNS("lift");
+
+		geometry_msgs::Vector3Stamped vec;
+		vec.header.frame_id= "table_top";
+		vec.vector.z= 1.0;
+		stage->setDirection(vec);
+		t.add(std::move(stage));
+	}
+
 	{
 		auto stage = std::make_unique<stages::Connect>("move to pre-pour pose", stages::Connect::GroupPlannerVector{{"arm", sampling_planner}});
 		stage->setTimeout(15.0);
@@ -118,7 +205,6 @@ int main(int argc, char** argv){
 		wrapper->properties().configureInitFrom(Stage::INTERFACE, {"target_pose"});
 		t.add(std::move(wrapper));
 	}
-*/
 
 	{
 		auto stage = std::make_unique<mtc_pour::PourInto>("pouring");
@@ -140,6 +226,93 @@ int main(int argc, char** argv){
 		t.add(std::move(stage));
 	}
 
+	// PLACE
+
+	{
+		auto stage = std::make_unique<stages::Connect>("move to pre-place pose", stages::Connect::GroupPlannerVector{{"arm", sampling_planner}});
+		stage->setTimeout(15.0);
+		stage->setPathConstraints(upright_constraint);
+		stage->properties().configureInitFrom(Stage::PARENT); // TODO: convenience-wrapper
+		t.add(std::move(stage));
+	}
+
+	{
+		auto stage = std::make_unique<stages::MoveRelative>("put down object", cartesian_planner);
+		stage->setMarkerNS("approach-place");
+		stage->properties().set("link", "s_model_tool0");
+		stage->properties().configureInitFrom(Stage::PARENT, {"group"});
+		stage->setMinMaxDistance(.08, .13);
+
+		geometry_msgs::Vector3Stamped vec;
+		vec.header.frame_id = "s_model_tool0";
+		vec.vector.z = -1.0;
+		stage->setDirection(vec);
+		t.add(std::move(stage));
+	}
+
+	{
+		auto stage = std::make_unique<stages::GeneratePose>("place pose");
+		geometry_msgs::PoseStamped p;
+		p.header.frame_id= "table_top";
+		p.pose.orientation.w= 1;
+		p.pose.position.x= -0.15;
+		p.pose.position.y=  0.35;
+		p.pose.position.z=  0.15;
+		stage->setPose(p);
+		stage->properties().configureInitFrom(Stage::PARENT);
+
+		stage->setMonitoredStage(object_grasped);
+
+		auto wrapper = std::make_unique<stages::ComputeIK>("place pose kinematics", std::move(stage) );
+		wrapper->setMaxIKSolutions(8);
+		// TODO: optionally in object frame
+		wrapper->properties().configureInitFrom(Stage::PARENT, {"eef"}); // TODO: convenience wrapper
+		wrapper->properties().configureInitFrom(Stage::INTERFACE, {"target_pose"});
+		t.add(std::move(wrapper));
+	}
+
+	{
+		auto stage = std::make_unique<stages::MoveTo>("release object", sampling_planner);
+		stage->properties().property("group").configureInitFrom(Stage::PARENT, "gripper"); // TODO this is not convenient
+		stage->setGoal("open");
+		t.add(std::move(stage));
+	}
+
+	{
+		auto stage = std::make_unique<stages::ModifyPlanningScene>("allow gripper->object collision");
+		stage->allowCollisions("bottle", t.getRobotModel()->getJointModelGroup("gripper")->getLinkModelNamesWithCollisionGeometry(), false);
+		t.add(std::move(stage));
+	}
+
+	{
+		auto stage = std::make_unique<stages::ModifyPlanningScene>("detach object");
+		stage->detachObject("bottle", "s_model_tool0");
+		object_grasped= stage.get();
+		t.add(std::move(stage));
+	}
+
+	{
+		auto stage = std::make_unique<stages::MoveRelative>("retreat after place", cartesian_planner);
+		stage->properties().configureInitFrom(Stage::PARENT, {"group"});
+		stage->setMinMaxDistance(.12,.25);
+		stage->setIKFrame("s_model_tool0"); // TODO property for frame
+
+		stage->setMarkerNS("post-place");
+
+		geometry_msgs::Vector3Stamped vec;
+		vec.header.frame_id= "s_model_tool0";
+		vec.vector.x= -1.0;
+		vec.vector.z= 0.75;
+		stage->setDirection(vec);
+		t.add(std::move(stage));
+	}
+
+	{
+		auto stage = std::make_unique<stages::MoveTo>("move home", sampling_planner);
+		stage->properties().configureInitFrom(Stage::PARENT, {"group"});
+		stage->setGoal("pour_default");
+		t.add(std::move(stage));
+	}
 
 	t.enableIntrospection();
 
@@ -170,19 +343,8 @@ int main(int argc, char** argv){
 	else {
 		moveit_task_constructor_msgs::Solution solution;
 		t.solutions().front()->fillMessage(solution);
-
 		std::cout << "executing solution" << std::endl;
-		// TODO: cut solution in
-		// solution.sub_trajectory[1 /*maybe 0*/].trajectory
-		// for pouring trajectory in the middle
-		// and send trajectories separately to execution
-		
-		//TODO: send first trajectory to /execute_trajectory ROS action
-	
-	    // TODO: wait for magic "finish" condition
-	    
-	    // TODO: send second half to execute
-		
+		mtc_pour::executeSolution(solution);
 		std::cout << "done" << std::endl;
 	}
 
